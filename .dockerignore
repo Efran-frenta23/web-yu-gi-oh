@@ -2,6 +2,7 @@ node_modules
 .svelte-kit
 build
 .git
+.github
 .gitignore
 .env
 .env.*.local
@@ -14,3 +15,12 @@ README.md
 QUICKSTART.md
 CLAUDE.md
 DEPLOY.md
+tests
+test
+__tests__
+docs
+coverage
+.vscode
+.idea
+snapshots
+*.bak

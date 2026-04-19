@@ -1,147 +1,163 @@
-# Deployment Guide — VPS (Ubuntu 24.04, 8GB RAM)
+# Deployment Guide — Dalang VPS (Ubuntu 24.04, 8 GB RAM)
 
-Target: Ubuntu 24.04 VPS, single host, 1 app instance + MySQL + Caddy in Docker. Caddy terminates HTTPS for your domain and reverse-proxies to the SvelteKit app.
+Target: single Dalang VPS (`vps-50e5d6dc`, service name `sigma`). HTTPS is terminated at the Dalang edge — the app itself listens on plain HTTP internally. Two containers: `app` (SvelteKit / adapter-node) + `mysql` (MySQL 8). **No Caddy** — Dalang routes public traffic to port 80 on the VPS by contract, so the reverse proxy layer is redundant. `docker compose` maps host `:80` directly to the app container's `:3000`.
 
-Tested sizing for 8GB RAM:
-- MySQL InnoDB buffer pool: 1 GB (configured in `docker-compose.prod.yml`)
-- App Node process: ~200–400 MB resident under load
-- Caddy: ~30 MB
-- Headroom: plenty for this workload
+Sizing baseline (8 GB RAM, 4 vCPU Xeon v3, 40 GB SSD ~8 MB/s sustained write, no swap):
+
+- MySQL InnoDB buffer pool: 1 GB
+- App Node process: ~200–400 MB under load, hard-capped at 1 GB via `mem_limit`
+- Guest-side free RAM after boot: ~7 GB (plenty of headroom)
+- **Images are built on your laptop, never on the VPS** — the VPS disk is too slow and the Xeon v3 is too old for `docker build` to be practical
 
 ---
 
-## 1. Prepare the VPS
+## 0. Prerequisites (one-time, laptop side)
 
-SSH in as root or a sudoer:
+- Docker 24+ with Buildx (`docker buildx version`)
+- `zstd` for the image-shipping pipe (`apt install zstd` / `brew install zstd`)
+- Dalang CLI authenticated (`dalang auth whoami`)
+- Repo checked out, `.env` NOT committed
+
+On the VPS (already true per probe):
+
+- Docker 29.x + Compose v5 installed
+- No public IPv4 — access is via `dalang shell vps-50e5d6dc`
+- Auto-assigned public domain: `50e5d6dc-6f31-4fb8-86f1-55830f9c8e04.svc.dalang.io`
+- TLS is terminated at the Dalang edge; traffic reaches the VPS as HTTP on port 80
+
+---
+
+## 1. First-time VPS setup
+
+Open a shell on the VPS:
 
 ```bash
-ssh user@your-vps
+dalang shell vps-50e5d6dc
 ```
 
-Install Docker Engine + Compose plugin:
+Create the deploy directory:
 
 ```bash
-sudo apt update && sudo apt install -y ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-   https://download.docker.com/linux/ubuntu \
-   $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
-  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo usermod -aG docker "$USER"
-# log out / back in so the group applies, or run `newgrp docker`
-```
-
-Verify:
-
-```bash
-docker version
-docker compose version
-```
-
-Open firewall ports 80 and 443 (ufw example):
-
-```bash
-sudo ufw allow 22/tcp
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw enable
-```
-
-## 2. Upload the project
-
-From your laptop:
-
-```bash
-rsync -az --delete \
-  --exclude node_modules --exclude .svelte-kit --exclude build \
-  --exclude .env --exclude sync.log \
-  yugioh-app/ user@your-vps:/opt/yugioh-app/
-```
-
-On the VPS:
-
-```bash
+sudo mkdir -p /opt/yugioh-app
+sudo chown "$USER":"$USER" /opt/yugioh-app
 cd /opt/yugioh-app
 ```
 
-## 3. Configure environment
+You only need three files on the VPS:
 
-Copy the example and edit:
+- `docker-compose.prod.yml`
+- `.env` (created from `.env.example`)
+- `scripts/docker-entrypoint.sh` (referenced by the Dockerfile, already baked into the image — only needed on the VPS if you plan to `docker compose build` there, which we don't)
+
+Upload them (from a separate laptop terminal, not the shell):
 
 ```bash
+# Example using `dalang shell` and a pipe — adjust if your CLI provides a copy helper
+cat docker-compose.prod.yml | dalang shell vps-50e5d6dc "cat > /opt/yugioh-app/docker-compose.prod.yml"
+cat .env.example           | dalang shell vps-50e5d6dc "cat > /opt/yugioh-app/.env.example"
+```
+
+### Configure `.env` on the VPS
+
+Inside `dalang shell vps-50e5d6dc`:
+
+```bash
+cd /opt/yugioh-app
 cp .env.example .env
 nano .env
 ```
 
-Required values for production:
+Set at minimum:
 
 ```
-MYSQL_ROOT_PASSWORD=<generate with: openssl rand -base64 24>
+MYSQL_ROOT_PASSWORD=<openssl rand -base64 24>
 MYSQL_DATABASE=yugioh_db
 MYSQL_USER=yugioh_user
-MYSQL_PASSWORD=<generate with: openssl rand -base64 24>
-
-# Inside the compose network the DB host is `mysql`:
-DATABASE_URL="mysql://yugioh_user:<same-as-above>@mysql:3306/yugioh_db?connection_limit=10&pool_timeout=20"
-
+MYSQL_PASSWORD=<openssl rand -base64 24>
+DATABASE_URL="mysql://yugioh_user:<same-as-MYSQL_PASSWORD>@mysql:3306/yugioh_db?connection_limit=10&pool_timeout=20"
 ORIGIN=https://50e5d6dc-6f31-4fb8-86f1-55830f9c8e04.svc.dalang.io
-CADDY_DOMAIN=50e5d6dc-6f31-4fb8-86f1-55830f9c8e04.svc.dalang.io
 PROTOCOL_HEADER=x-forwarded-proto
 HOST_HEADER=x-forwarded-host
 BODY_SIZE_LIMIT=512K
 PORT=3000
 ```
 
-Lock permissions:
+Lock it down:
 
 ```bash
 chmod 600 .env
 ```
 
-## 4. First-time build + start
+---
+
+## 2. Deploy #1 — build locally, ship image via pipe
+
+No registry, no PAT. Best for initial bring-up and for when GHCR auth isn't set up yet.
+
+On your laptop, from the app repo root:
 
 ```bash
-docker compose -f docker-compose.prod.yml build
-docker compose -f docker-compose.prod.yml up -d
+# Build for the VPS's architecture (linux/amd64)
+docker buildx build --platform linux/amd64 -t yugioh-app:latest --load .
+
+# Ship the image to the VPS, compressed
+docker save yugioh-app:latest \
+  | zstd -T0 -3 \
+  | dalang shell vps-50e5d6dc "zstd -d | docker load"
 ```
 
-Watch logs until MySQL is healthy and the app finishes `prisma db push`:
+On a 20 Mbps link, a ~150 MB compressed image transfers in roughly 60 seconds.
+
+Then inside `dalang shell vps-50e5d6dc`:
 
 ```bash
+cd /opt/yugioh-app
+docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml logs -f app mysql
 ```
 
-Expected: `[entrypoint] starting app...` then SvelteKit listening on port 3000.
+The `app` container will run `prisma db push` on startup, then `node build`. Wait for the line `[entrypoint] starting app...` followed by SvelteKit listening on port 3000.
 
-## 5. Populate cards (initial sync)
+> Note: `docker-compose.prod.yml` still carries a `build:` block so `docker compose build` works locally. In prod we never build — we just use the `image: yugioh-app:latest` tag that `docker load` just populated.
 
-The DB starts empty. Run the full sync inside the app container:
+---
+
+## 3. Populate cards (initial sync)
+
+The DB starts empty. Run the full sync once:
 
 ```bash
+# inside dalang shell vps-50e5d6dc, cd /opt/yugioh-app
 docker compose -f docker-compose.prod.yml exec app node_modules/.bin/tsx scripts/sync-cards.ts
 ```
 
-This takes roughly 5–10 minutes depending on the upstream API. Rerun at any time — the script is idempotent (`upsert`).
+Expect 5–10 minutes depending on the upstream API. The script is idempotent (`upsert`) — safe to rerun.
 
-## 6. Verify
+---
+
+## 4. Verify
 
 From your laptop:
 
 ```bash
 curl -I https://50e5d6dc-6f31-4fb8-86f1-55830f9c8e04.svc.dalang.io/
-curl https://50e5d6dc-6f31-4fb8-86f1-55830f9c8e04.svc.dalang.io/api/health?deep=1
+curl   https://50e5d6dc-6f31-4fb8-86f1-55830f9c8e04.svc.dalang.io/api/health
+curl  'https://50e5d6dc-6f31-4fb8-86f1-55830f9c8e04.svc.dalang.io/api/health?deep=1'
 ```
 
-Caddy auto-issues a Let's Encrypt cert on first request. The first call may take ~15 s while it provisions.
+Expected:
 
-## 7. Schedule incremental sync (host cron)
+- Homepage: `HTTP/2 200`
+- `/api/health`: `{ "ok": true, ... }`
+- `/api/health?deep=1`: `{ "ok": true, "db": "ok", ... }`
 
-Add a weekly incremental sync via the host's crontab:
+If the edge returns `Domain Not Found`, the Dalang routing slot for this service hasn't been activated. Check the Dalang dashboard (`dalang.io` → VPS `sigma` → Public Domain section). The CLI today has no `dalang domain` flag for port/routing, so activation is dashboard-only.
+
+---
+
+## 5. Schedule incremental sync (host cron)
+
+Inside the VPS shell:
 
 ```bash
 crontab -e
@@ -154,32 +170,86 @@ Append:
 0 3 * * 0 cd /opt/yugioh-app && /usr/bin/docker compose -f docker-compose.prod.yml exec -T app node_modules/.bin/tsx scripts/sync-cards.ts --since=14d >> /var/log/yugioh-sync.log 2>&1
 ```
 
-## 8. Ongoing operations
+---
+
+## 6. Deploy #2 onward — GHCR (recommended for iterative deploys)
+
+Layer reuse over the 20 Mbps pipe means subsequent deploys transfer only changed layers (~5–20 MB, ~10–30 s).
+
+### One-time setup
+
+1. On GitHub: Settings → Developer settings → Personal access tokens (classic) → generate with scopes `write:packages`, `read:packages`.
+2. Laptop:
+   ```bash
+   echo <PAT> | docker login ghcr.io -u efran-frenta23 --password-stdin
+   ```
+3. VPS (only needed if you keep the GHCR package private — public packages don't require auth to pull):
+   ```bash
+   dalang shell vps-50e5d6dc 'echo <PAT> | docker login ghcr.io -u efran-frenta23 --password-stdin'
+   ```
+
+### Per deploy
+
+```bash
+TAG=$(git rev-parse --short HEAD)
+
+docker buildx build --platform linux/amd64 \
+  -t ghcr.io/efran-frenta23/yugioh-app:$TAG \
+  -t ghcr.io/efran-frenta23/yugioh-app:latest \
+  --push .
+
+dalang shell vps-50e5d6dc "cd /opt/yugioh-app \
+  && docker compose -f docker-compose.prod.yml pull app \
+  && docker compose -f docker-compose.prod.yml up -d app"
+```
+
+When you switch to this flow, also update `docker-compose.prod.yml` on the VPS so the `app` service is:
+
+```yaml
+app:
+  image: ghcr.io/efran-frenta23/yugioh-app:latest
+  # remove the `build:` block
+  ...
+```
+
+This keeps the prod compose file pull-only.
+
+---
+
+## 7. Ongoing operations
 
 | Task | Command |
 |---|---|
-| Pull new code | `rsync ...` again, then `docker compose -f docker-compose.prod.yml build app && docker compose -f docker-compose.prod.yml up -d app` |
+| VPS shell | `dalang shell vps-50e5d6dc` |
 | Tail app logs | `docker compose -f docker-compose.prod.yml logs -f app` |
-| Restart app only | `docker compose -f docker-compose.prod.yml restart app` |
-| MySQL shell | `docker compose -f docker-compose.prod.yml exec mysql mysql -u root -p$MYSQL_ROOT_PASSWORD yugioh_db` |
-| Backup DB | `docker compose -f docker-compose.prod.yml exec -T mysql mysqldump -u root -p$MYSQL_ROOT_PASSWORD yugioh_db | gzip > backup-$(date +%F).sql.gz` |
+| Restart app | `docker compose -f docker-compose.prod.yml restart app` |
+| MySQL shell | `docker compose -f docker-compose.prod.yml exec mysql mysql -u root -p"$MYSQL_ROOT_PASSWORD" yugioh_db` |
+| Backup DB | `docker compose -f docker-compose.prod.yml exec -T mysql mysqldump -u root -p"$MYSQL_ROOT_PASSWORD" yugioh_db \| gzip > backup-$(date +%F).sql.gz` |
 | Force full resync | `docker compose -f docker-compose.prod.yml exec app node_modules/.bin/tsx scripts/sync-cards.ts` |
+| VPS snapshot | dalang.io dashboard → VPS `sigma` → Snapshots → Create Snapshot (max 3) |
 
-## 9. Scaling beyond 1 instance
+---
 
-Single instance on 8 GB will handle the "tens of thousands concurrent viewers, hundreds of RPS" range for this workload (read-heavy, cached). If you outgrow it:
+## 8. Scaling beyond one instance
 
-1. **Vertical first** — bigger VPS (16 GB RAM, 4 vCPU), bump `innodb-buffer-pool-size`, raise `connection_limit` in `DATABASE_URL`.
-2. **Move cache to Redis** — the `cached()` helper in `src/lib/server/cache.ts` is in-process today. Replace with a Redis-backed implementation so multiple app replicas share cache.
-3. **Scale app horizontally** — run N `app` replicas behind Caddy's `reverse_proxy` (it load-balances by default when you list multiple upstreams). MySQL stays single-instance; add a read replica only if reads become the bottleneck.
-4. **Offload images** — Caddy can proxy and cache upstream `images.ygoprodeck.com` responses on disk to reduce outbound requests.
+The single-VPS setup comfortably serves the read-heavy, cached workload at the target range. If you outgrow it:
 
-## 10. Troubleshooting
+1. **Vertical first** — upgrade Dalang VPS tier (more vCPU/RAM), bump `innodb-buffer-pool-size` and `connection_limit`.
+2. **Swap in-process cache for Redis** — `src/lib/server/cache.ts` is per-process today. Replace with a Redis-backed implementation so multiple app replicas share a cache.
+3. **Horizontal app replicas** — add a small proxy container listening on `:80` that load-balances across N `app` containers. (Dalang edge still only forwards to `:80`, so you re-introduce a proxy layer at that point — not before.)
+4. **CDN for static assets** — upload `build/client/_app/immutable/*` to Cloudflare R2/Pages and rewrite the base path. Reduces VPS egress on the 20 Mbps pipe, which becomes the first bottleneck at scale.
+
+---
+
+## 9. Troubleshooting
 
 | Symptom | Check |
 |---|---|
-| Caddy can't issue cert | `docker compose -f docker-compose.prod.yml logs caddy` — usually DNS not pointing to VPS or port 80 blocked |
-| App restart loop | `docker compose -f docker-compose.prod.yml logs app` — most often `DATABASE_URL` wrong or MySQL not healthy |
-| `prisma db push` wants to drop data | Schema drift. Inspect `docker compose -f docker-compose.prod.yml run --rm app npx prisma db pull` and resolve manually |
-| 429 Too Many Requests on `/api/*` | Rate limit (120 GET/min, 10 write/min per IP). Tune in `src/hooks.server.ts` |
-| Homepage stats feel stale | Expected — cached 30 min. Restart app to purge: `docker compose restart app` |
+| `Domain Not Found` at edge | Dalang routing slot inactive. Open dashboard → VPS `sigma` → Public Domain section. |
+| App restart loop | `docker compose logs app` — usually `DATABASE_URL` wrong, MySQL unhealthy, or missing `ORIGIN` |
+| `prisma db push` wants to drop data | Schema drift. `docker compose run --rm app npx prisma db pull` and resolve manually |
+| 429 on `/api/*` | Rate limit (120 GET/min, 10 write/min per IP). Tune in `src/hooks.server.ts` |
+| Homepage stats feel stale | Cached up to 30 min. Restart app to purge: `docker compose restart app` |
+| Image push slow | 20 Mbps ≈ 2.5 MB/s. Trim image or switch to GHCR with layer reuse |
+| OOM-kill | VPS has no swap. Inspect `mem_limit`, MySQL buffer pool. Consider enabling zram on the VPS. |
+| `node: not found` inside container | You're on the wrong image tag — re-run the pipe/push for the correct `linux/amd64` build |

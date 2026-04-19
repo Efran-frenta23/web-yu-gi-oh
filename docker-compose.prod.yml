@@ -31,6 +31,9 @@ services:
     image: yugioh-app:latest
     container_name: yugioh-app
     restart: unless-stopped
+    mem_limit: 1g
+    ports:
+      - "80:3000"
     environment:
       NODE_ENV: production
       DATABASE_URL: "mysql://${MYSQL_USER:-yugioh_user}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE:-yugioh_db}?connection_limit=10&pool_timeout=20"
@@ -44,33 +47,10 @@ services:
         condition: service_healthy
     networks:
       - internal
-      - web
-
-  caddy:
-    image: caddy:2-alpine
-    container_name: yugioh-caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    environment:
-      CADDY_DOMAIN: ${CADDY_DOMAIN:?set in .env}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on:
-      - app
-    networks:
-      - web
 
 volumes:
   mysql_data:
-  caddy_data:
-  caddy_config:
 
 networks:
   internal:
-    driver: bridge
-  web:
     driver: bridge

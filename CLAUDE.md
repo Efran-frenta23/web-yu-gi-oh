@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Yu-Gi-Oh! card database + deck builder targeted at Yu-Gi-Oh! players. Card data comes from the YGOProDeck public API (`https://db.ygoprodeck.com/api/v7`) and is mirrored into a local MySQL database so the app reads from its own DB, not the upstream API at request time.
 
-Production target: a single Ubuntu VPS running `docker compose -f docker-compose.prod.yml` (app + MySQL + Caddy). Full deploy runbook in `DEPLOY.md`.
+Production target: a single Dalang VPS (`vps-50e5d6dc`) running `docker compose -f docker-compose.prod.yml` with two containers — `app` (SvelteKit) + `mysql`. HTTPS is terminated at the Dalang edge; the app listens on plain HTTP and Docker maps host `:80` → container `:3000`. No reverse proxy (no Caddy). Full deploy runbook in `DEPLOY.md`.
 
 ## Commands
 
@@ -44,7 +44,7 @@ First-run bootstrap (dev): `docker:up` → `db:push` → `sync:cards` → `dev`.
 
 **Caching (`src/lib/server/cache.ts`).** In-process TTL cache with request coalescing. Used for homepage stats, archetype list, filter dropdowns, card detail pages, and search results. TTLs: `SHORT=60s`, `DEFAULT=5m`, `LONG=30m`. Cache keys are deterministic strings — see existing call sites before adding new ones. To scale past one app instance, swap this module for a Redis-backed implementation (same `cached()` / `invalidate()` signature).
 
-**Rate limiting (`src/hooks.server.ts` + `src/lib/server/rate-limit.ts`).** Per-IP token bucket on `/api/*`: 120 req/min for GET, 10 req/min for writes. `/api/health` is exempt (Docker healthcheck). Client IP is resolved via `x-forwarded-for` first so it works behind Caddy.
+**Rate limiting + security headers (`src/hooks.server.ts` + `src/lib/server/rate-limit.ts`).** Per-IP token bucket on `/api/*`: 120 req/min for GET, 10 req/min for writes. `/api/health` is exempt (Docker healthcheck). Client IP is resolved via `x-forwarded-for` first so it works behind the Dalang edge. The same hook sets `x-content-type-options`, `referrer-policy`, `x-frame-options` on every response (no upstream proxy to do it).
 
 **Prisma schema highlights** (`prisma/schema.prisma`):
 - Preview features `fullTextIndex` + `fullTextSearch` are enabled. `Card.name` has a FULLTEXT index (`Card_name_ft`) — for search, prefer `prisma.card.findMany({ where: { name: { search: '+term*' } } })` over `contains` as usage grows.
@@ -60,15 +60,15 @@ First-run bootstrap (dev): `docker:up` → `db:push` → `sync:cards` → `dev`.
 - `src/routes/decks/builder/+page.svelte` — client-side deck builder; saves via `POST /api/decks`.
 - `src/routes/api/health/+server.ts` — liveness (`GET /api/health`) and DB readiness (`GET /api/health?deep=1`). Used by the Docker healthcheck.
 
-**Env.** `.env` is gitignored — copy from `.env.example`. Required in production: `DATABASE_URL`, `MYSQL_*` (compose uses these to provision the DB), `ORIGIN` (full https URL — SvelteKit rejects form POSTs without this), `CADDY_DOMAIN`, plus proxy headers (`PROTOCOL_HEADER`, `HOST_HEADER`).
+**Env.** `.env` is gitignored — copy from `.env.example`. Required in production: `DATABASE_URL`, `MYSQL_*` (compose uses these to provision the DB), `ORIGIN` (full https URL — SvelteKit rejects form POSTs without this), plus proxy headers (`PROTOCOL_HEADER=x-forwarded-proto`, `HOST_HEADER=x-forwarded-host`) so SvelteKit trusts what the Dalang edge forwards.
 
 ## Production deployment
 
-- `Dockerfile` — multi-stage (`deps` → `build` → `runtime`), runs as non-root `app` user, uses `tini` as PID 1, healthchecks `/api/health`.
+- `Dockerfile` — multi-stage (`deps` → `build` → `runtime`) on `node:22-alpine`, runs as non-root `app` user, uses `tini` as PID 1, healthchecks `/api/health`. Build is done on the laptop (VPS disk is too slow) and shipped via pipe or GHCR — see `DEPLOY.md`.
 - `scripts/docker-entrypoint.sh` — runs `prisma db push --skip-generate --accept-data-loss=false` before `node build`. Set `SKIP_DB_PUSH=1` to bypass.
-- `docker-compose.prod.yml` — `mysql` (no host port exposed), `app` (internal network only), `caddy` (80/443 exposed). Passwords required via `.env`.
-- `Caddyfile` — auto-HTTPS via Let's Encrypt. Sets `Cache-Control: immutable` for `/_app/immutable/*` build assets, trusts X-Forwarded-* from private ranges, strips `Server` header.
-- See `DEPLOY.md` for the end-to-end runbook (VPS setup, cron for incremental sync, backup/restore, scaling notes).
+- `docker-compose.prod.yml` — `mysql` (no host port exposed, internal network only) + `app` (host `:80` → container `:3000`, `mem_limit: 1g`). No Caddy — Dalang edge terminates HTTPS and forwards to VPS port 80 by contract. Passwords required via `.env`.
+- `svelte.config.js` — adapter-node with `precompress: true` so `.gz`/`.br` variants of static assets are emitted at build time (saves CPU on the older Xeon v3 VPS).
+- See `DEPLOY.md` for the end-to-end runbook (Dalang shell access, pipe vs GHCR deploy, cron for incremental sync, backup/restore, scaling notes).
 
 ## Things to know before editing
 
