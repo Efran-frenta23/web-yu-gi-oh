@@ -90,35 +90,65 @@ chmod 600 .env
 
 ---
 
-## 2. Deploy #1 — build locally, ship image via pipe
+## 2. Deploy — GHCR (the only deploy path that works here)
 
-No registry, no PAT. Best for initial bring-up and for when GHCR auth isn't set up yet.
+> **Why not a pipe?** `dalang shell vps-<name> "..."` corrupts binary stdin (PTY-mediated) and the trailing-command form hangs anyway. `scp` isn't available either — the VPS has no public IPv4. GHCR is the only clean route: push from laptop → pull on VPS through the Dalang edge.
 
-On your laptop, from the app repo root:
+### One-time setup
+
+1. On GitHub → Settings → Developer settings → Personal access tokens (classic) → **Generate new token (classic)**. Scopes: `write:packages`, `read:packages`. Pick an expiration you're comfortable with (30–90 days is fine; you can revoke after deploy).
+
+2. On your laptop:
+   ```bash
+   echo <PAT> | docker login ghcr.io -u efran-frenta23 --password-stdin
+   ```
+
+3. Decide package visibility. **Recommended: public** — the source code is already public on GitHub, the image is a deterministic build of it, and public packages let the VPS pull without auth (one less friction point through the buggy `dalang shell`). To mark public after the first push:
+   - github.com → your profile → Packages → `yugioh-app` → Package settings → Change visibility → Public.
+
+   If you keep it private, the VPS also needs to log in — and `dalang shell` stdin is the only path, see §7.
+
+### Per deploy
+
+From the app repo root on your laptop:
 
 ```bash
-# Build for the VPS's architecture (linux/amd64)
-docker buildx build --platform linux/amd64 -t yugioh-app:latest --load .
+TAG=$(git rev-parse --short HEAD)
 
-# Ship the image to the VPS, compressed
-docker save yugioh-app:latest \
-  | zstd -T0 -3 \
-  | dalang shell vps-50e5d6dc "zstd -d | docker load"
+docker buildx build --platform linux/amd64 \
+  -t ghcr.io/efran-frenta23/yugioh-app:$TAG \
+  -t ghcr.io/efran-frenta23/yugioh-app:latest \
+  --push .
 ```
 
-On a 20 Mbps link, a ~150 MB compressed image transfers in roughly 60 seconds.
-
-Then inside `dalang shell vps-50e5d6dc`:
+Then trigger the VPS to pull + roll. Because `dalang shell vps-<name> "cmd"` hangs, pipe the command in via stdin:
 
 ```bash
+echo 'cd /opt/yugioh-app \
+  && docker compose -f docker-compose.prod.yml pull app \
+  && docker compose -f docker-compose.prod.yml up -d app' \
+  | dalang shell vps-50e5d6dc
+```
+
+On deploy #1 you also need the `mysql` container up, so the first time run:
+
+```bash
+echo 'cd /opt/yugioh-app && docker compose -f docker-compose.prod.yml up -d' \
+  | dalang shell vps-50e5d6dc
+```
+
+Tail logs interactively to confirm:
+
+```bash
+dalang shell vps-50e5d6dc
+# then inside the shell:
 cd /opt/yugioh-app
-docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml logs -f app mysql
 ```
 
-The `app` container will run `prisma db push` on startup, then `node build`. Wait for the line `[entrypoint] starting app...` followed by SvelteKit listening on port 3000.
+Wait for `[entrypoint] starting app...` and SvelteKit listening on `:3000`. The `app` container runs `prisma db push` on startup, so deploy #1 includes schema apply automatically.
 
-> Note: `docker-compose.prod.yml` still carries a `build:` block so `docker compose build` works locally. In prod we never build — we just use the `image: yugioh-app:latest` tag that `docker load` just populated.
+Layer reuse kicks in from deploy #2 onward — expect 10–30 s per deploy on the 20 Mbps pipe instead of the 60 s first pull.
 
 ---
 
@@ -172,61 +202,42 @@ Append:
 
 ---
 
-## 6. Deploy #2 onward — GHCR (recommended for iterative deploys)
+## 6. Fallback if GHCR is unavailable (not recommended)
 
-Layer reuse over the 20 Mbps pipe means subsequent deploys transfer only changed layers (~5–20 MB, ~10–30 s).
-
-### One-time setup
-
-1. On GitHub: Settings → Developer settings → Personal access tokens (classic) → generate with scopes `write:packages`, `read:packages`.
-2. Laptop:
-   ```bash
-   echo <PAT> | docker login ghcr.io -u efran-frenta23 --password-stdin
-   ```
-3. VPS (only needed if you keep the GHCR package private — public packages don't require auth to pull):
-   ```bash
-   dalang shell vps-50e5d6dc 'echo <PAT> | docker login ghcr.io -u efran-frenta23 --password-stdin'
-   ```
-
-### Per deploy
+Only relevant if GitHub Packages is down or you can't generate a PAT. **Not tested in this setup** — use at your own risk and burn the uploaded artifact afterwards.
 
 ```bash
-TAG=$(git rev-parse --short HEAD)
+# Laptop
+docker save ghcr.io/efran-frenta23/yugioh-app:latest \
+  | zstd -T0 -3 > /tmp/yugioh.tar.zst
+# Upload /tmp/yugioh.tar.zst to a one-shot public host (e.g. transfer.sh,
+# catbox.moe). Copy the URL.
 
-docker buildx build --platform linux/amd64 \
-  -t ghcr.io/efran-frenta23/yugioh-app:$TAG \
-  -t ghcr.io/efran-frenta23/yugioh-app:latest \
-  --push .
-
-dalang shell vps-50e5d6dc "cd /opt/yugioh-app \
-  && docker compose -f docker-compose.prod.yml pull app \
-  && docker compose -f docker-compose.prod.yml up -d app"
+# VPS — via dalang shell (interactive)
+dalang shell vps-50e5d6dc
+# inside:
+curl -fsSL <url> | zstd -d | docker load
+docker compose -f /opt/yugioh-app/docker-compose.prod.yml up -d
 ```
 
-When you switch to this flow, also update `docker-compose.prod.yml` on the VPS so the `app` service is:
-
-```yaml
-app:
-  image: ghcr.io/efran-frenta23/yugioh-app:latest
-  # remove the `build:` block
-  ...
-```
-
-This keeps the prod compose file pull-only.
+Caveats: image is briefly publicly accessible on the intermediate host, the upload consumes bandwidth twice, and you still need GHCR (or another route) for deploy #2. Default to §2.
 
 ---
 
 ## 7. Ongoing operations
 
-| Task | Command |
+> **`dalang shell` quirks (CLI v1.2.0-dirty):** the trailing-command form (`dalang shell vps-<name> "cmd"`) hangs for 60+ s. Use either interactive mode or stdin: `echo 'cmd' | dalang shell vps-50e5d6dc`. Binary stdin is corrupt — no pipe-through-tar/image transfers.
+
+| Task | Command (run in interactive `dalang shell vps-50e5d6dc`) |
 |---|---|
-| VPS shell | `dalang shell vps-50e5d6dc` |
-| Tail app logs | `docker compose -f docker-compose.prod.yml logs -f app` |
-| Restart app | `docker compose -f docker-compose.prod.yml restart app` |
-| MySQL shell | `docker compose -f docker-compose.prod.yml exec mysql mysql -u root -p"$MYSQL_ROOT_PASSWORD" yugioh_db` |
-| Backup DB | `docker compose -f docker-compose.prod.yml exec -T mysql mysqldump -u root -p"$MYSQL_ROOT_PASSWORD" yugioh_db \| gzip > backup-$(date +%F).sql.gz` |
-| Force full resync | `docker compose -f docker-compose.prod.yml exec app node_modules/.bin/tsx scripts/sync-cards.ts` |
+| Open VPS shell | `dalang shell vps-50e5d6dc` (interactive) |
+| Tail app logs | `docker compose -f /opt/yugioh-app/docker-compose.prod.yml logs -f app` |
+| Restart app | `docker compose -f /opt/yugioh-app/docker-compose.prod.yml restart app` |
+| MySQL shell | `docker compose -f /opt/yugioh-app/docker-compose.prod.yml exec mysql mysql -u root -p"$MYSQL_ROOT_PASSWORD" yugioh_db` |
+| Backup DB | `docker compose -f /opt/yugioh-app/docker-compose.prod.yml exec -T mysql mysqldump -u root -p"$MYSQL_ROOT_PASSWORD" yugioh_db \| gzip > backup-$(date +%F).sql.gz` |
+| Force full resync | `docker compose -f /opt/yugioh-app/docker-compose.prod.yml exec app node_modules/.bin/tsx scripts/sync-cards.ts` |
 | VPS snapshot | dalang.io dashboard → VPS `sigma` → Snapshots → Create Snapshot (max 3) |
+| GHCR private-package login on VPS | `echo '<PAT>' \| dalang shell vps-50e5d6dc` then inside: `echo <PAT> \| docker login ghcr.io -u efran-frenta23 --password-stdin` (skip if package is public) |
 
 ---
 
@@ -250,6 +261,8 @@ The single-VPS setup comfortably serves the read-heavy, cached workload at the t
 | `prisma db push` wants to drop data | Schema drift. `docker compose run --rm app npx prisma db pull` and resolve manually |
 | 429 on `/api/*` | Rate limit (120 GET/min, 10 write/min per IP). Tune in `src/hooks.server.ts` |
 | Homepage stats feel stale | Cached up to 30 min. Restart app to purge: `docker compose restart app` |
-| Image push slow | 20 Mbps ≈ 2.5 MB/s. Trim image or switch to GHCR with layer reuse |
+| Image push slow | 20 Mbps ≈ 2.5 MB/s. First push ~60 s, deploy #2+ uses layer reuse (~10–30 s). |
 | OOM-kill | VPS has no swap. Inspect `mem_limit`, MySQL buffer pool. Consider enabling zram on the VPS. |
-| `node: not found` inside container | You're on the wrong image tag — re-run the pipe/push for the correct `linux/amd64` build |
+| `exec format error` / `node: not found` | Built for wrong arch. Re-run `docker buildx build --platform linux/amd64 ... --push`. |
+| `dalang shell vps-... "cmd"` hangs | CLI quirk — don't use the trailing-command form. Use stdin: `echo 'cmd' \| dalang shell vps-50e5d6dc`, or interactive. |
+| `denied: permission_denied` on pull | Either the image is private and VPS hasn't logged in to GHCR, or the tag doesn't exist yet. Check github.com → Packages. |

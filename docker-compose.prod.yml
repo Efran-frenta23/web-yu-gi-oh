@@ -25,10 +25,13 @@ services:
       start_period: 30s
 
   app:
+    # `build:` kept so `docker compose build` works locally; in prod the
+    # VPS runs `docker compose pull` which uses `image:` only. Image is
+    # pushed from the laptop via `docker buildx ... --push`.
     build:
       context: .
       dockerfile: Dockerfile
-    image: yugioh-app:latest
+    image: ghcr.io/efran-frenta23/yugioh-app:latest
     container_name: yugioh-app
     restart: unless-stopped
     mem_limit: 1g
