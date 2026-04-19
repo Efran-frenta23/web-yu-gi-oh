@@ -1,0 +1,37 @@
+{
+	# Global options
+	email admin@{$CADDY_DOMAIN}
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+{$CADDY_DOMAIN} {
+	encode zstd gzip
+
+	# Cache static build assets aggressively (hashed filenames)
+	@immutable path /_app/immutable/*
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+
+	# Short cache for JSON search API
+	@apiCards path /api/cards
+	header @apiCards Cache-Control "public, max-age=30"
+
+	# Don't cache the HTML or health endpoint
+	@nocache path /api/health /api/decks
+	header @nocache Cache-Control "no-store"
+
+	# Basic security headers
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "DENY"
+		-Server
+	}
+
+	reverse_proxy app:3000 {
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+		header_up X-Real-IP {remote_host}
+	}
+}

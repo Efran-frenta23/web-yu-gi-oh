@@ -1,0 +1,16 @@
+node_modules
+.svelte-kit
+build
+.git
+.gitignore
+.env
+.env.*.local
+.env.production
+!.env.example
+*.log
+sync.log
+.DS_Store
+README.md
+QUICKSTART.md
+CLAUDE.md
+DEPLOY.md

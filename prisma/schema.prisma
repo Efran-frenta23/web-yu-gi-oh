@@ -1,0 +1,68 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextIndex", "fullTextSearch"]
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model Card {
+  id         Int         @id
+  name       String      @db.VarChar(255)
+  type       String      @db.VarChar(100)
+  frameType  String      @db.VarChar(50)
+  desc       String      @db.Text
+  race       String      @db.VarChar(100)
+  archetype  String?     @db.VarChar(100)
+  atk        Int?
+  def        Int?
+  level      Int?
+  attribute  String?     @db.VarChar(50)
+  cardImages CardImage[]
+  cardPrices CardPrice[]
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  @@index([type])
+  @@index([attribute])
+  @@index([archetype])
+  @@index([race])
+  @@fulltext([name], map: "Card_name_ft")
+}
+
+model CardImage {
+  id        Int    @id @default(autoincrement())
+  cardId    Int
+  imageUrl  String @db.Text
+  imageType String @db.VarChar(50)
+  card      Card   @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@unique([cardId, imageType])
+  @@index([cardId])
+}
+
+model CardPrice {
+  id           Int   @id @default(autoincrement())
+  cardId       Int   @unique
+  cardmarket   Float @default(0)
+  tcgplayer    Float @default(0)
+  ebay         Float @default(0)
+  amazon       Float @default(0)
+  coolstuffinc Float @default(0)
+  card         Card  @relation(fields: [cardId], references: [id], onDelete: Cascade)
+}
+
+model Deck {
+  id          String   @id @default(uuid())
+  name        String   @db.VarChar(255)
+  description String?  @db.Text
+  mainDeck    Json     @db.Json
+  extraDeck   Json     @db.Json
+  sideDeck    Json     @db.Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([createdAt])
+}
